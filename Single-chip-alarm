@@ -1,0 +1,523 @@
+#include <reg52.h>
+#include <intrins.h>
+ 
+#define uchar unsigned char		// 以后unsigned char就可以用uchar代替
+#define uint  unsigned int		// 以后unsigned int 就可以用uint 代替
+ 
+sfr ISP_DATA  = 0xe2;			// 数据寄存器
+sfr ISP_ADDRH = 0xe3;			// 地址寄存器高八位
+sfr ISP_ADDRL = 0xe4;			// 地址寄存器低八位
+sfr ISP_CMD   = 0xe5;			// 命令寄存器
+sfr ISP_TRIG  = 0xe6;			// 命令触发寄存器
+sfr ISP_CONTR = 0xe7;			// 命令寄存器
+ 
+sbit DQ       = P1^1;			// 温度传感器的引脚
+sbit ADC_CS   = P1^2; 			// ADC0832的CS引脚
+sbit ADC_CLK  = P1^3; 			// ADC0832的CLK引脚
+sbit ADC_DAT  = P1^4; 		// ADC0832的DI/DO引脚
+sbit LcdRs_P  = P2^7;     		// 1602液晶的RS管脚       
+sbit LcdRw_P  = P2^6;     		// 1602液晶的RW管脚 
+sbit LcdEn_P  = P2^5;     		// 1602液晶的EN管脚
+sbit Key1_P   = P3^2;			// 设置按键
+sbit Key2_P   = P3^3;			// 减按键
+sbit Key3_P   = P3^4;			// 加按键
+sbit Buzzer_P = P2^0;			// 蜂鸣器
+sbit Led1_P   = P2^3;			// 报警灯1，温度报警
+sbit Led2_P   = P2^2;			// 报警灯2，烟雾报警
+ 
+uchar gMqAlarm;				// 烟雾报警值
+int   gTempAlarm;				// 温度报警值
+ 
+/*********************************************************/
+// 单片机内部EEPROM不使能
+/*********************************************************/
+void ISP_Disable()
+{
+	ISP_CONTR = 0;
+	ISP_ADDRH = 0;
+	ISP_ADDRL = 0;
+}
+ 
+/*********************************************************/
+// 从单片机内部EEPROM读一个字节，从0x2000地址开始
+/*********************************************************/
+unsigned char EEPROM_Read(unsigned int add)
+{
+	ISP_DATA  = 0x00;
+	ISP_CONTR = 0x83;
+	ISP_CMD   = 0x01;
+	ISP_ADDRH = (unsigned char)(add>>8);
+	ISP_ADDRL = (unsigned char)(add&0xff);
+	// 对STC89C51系列来说，每次要写入0x46，再写入0xB9,ISP/IAP才会生效
+	ISP_TRIG  = 0x46;	   
+	ISP_TRIG  = 0xB9;
+	_nop_();
+	ISP_Disable();
+	return (ISP_DATA);
+}
+ 
+/*********************************************************/
+// 往单片机内部EEPROM写一个字节，从0x2000地址开始
+/*********************************************************/
+void EEPROM_Write(unsigned int add,unsigned char ch)
+{
+	ISP_CONTR = 0x83;
+	ISP_CMD   = 0x02;
+	ISP_ADDRH = (unsigned char)(add>>8);
+	ISP_ADDRL = (unsigned char)(add&0xff);
+	ISP_DATA  = ch;
+	ISP_TRIG  = 0x46;
+	ISP_TRIG  = 0xB9;
+	_nop_();
+	ISP_Disable();
+}
+ 
+/*********************************************************/
+// 擦除单片机内部EEPROM的一个扇区
+// 写8个扇区中随便一个的地址，便擦除该扇区，写入前要先擦除
+/*********************************************************/
+void Sector_Erase(unsigned int add)	  
+{
+	ISP_CONTR = 0x83;
+	ISP_CMD   = 0x03;
+	ISP_ADDRH = (unsigned char)(add>>8);
+	ISP_ADDRL = (unsigned char)(add&0xff);
+	ISP_TRIG  = 0x46;
+	ISP_TRIG  = 0xB9;
+	_nop_();
+	ISP_Disable();
+}
+ 
+/*********************************************************/
+// 毫秒级的延时函数，time是要延时的毫秒数
+/*********************************************************/
+void DelayMs(uint time)
+{
+	uint i,j;
+	for(i=0;i<time;i++)
+		for(j=0;j<112;j++);
+}
+ 
+/*********************************************************/
+// 延时15微秒
+/*********************************************************/
+void Delay15us(void)
+{
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+	_nop_();
+}
+ 
+/*********************************************************/
+// 复位DS18B20（初始化）
+/*********************************************************/
+void DS18B20_ReSet(void)
+{
+	uchar i;
+	DQ=0;
+	i=240;
+	while(--i);
+	DQ=1;
+	i=30;
+	while(--i);
+	while(~DQ);
+	i=4;
+	while(--i);
+}
+ 
+/*********************************************************/
+// 向DS18B20写入一个字节
+/*********************************************************/
+void DS18B20_WriteByte(uchar dat)
+{
+	uchar j;
+	uchar btmp;
+	for(j=0;j<8;j++)
+	{
+		btmp=0x01;
+		btmp=btmp<<j;
+		btmp=btmp&dat;
+		if(btmp>0)		// 写1
+		{
+			DQ=0;
+			Delay15us();
+			DQ=1;
+			Delay15us();
+			Delay15us();
+			Delay15us();
+			Delay15us();
+		}
+		else			// 写0
+		{
+			DQ=0;
+			Delay15us();
+			Delay15us();
+			Delay15us();
+			Delay15us();
+			DQ=1;
+			Delay15us();
+		}
+	}
+}
+ 
+/*********************************************************/
+// 读取温度值
+/*********************************************************/
+int DS18B20_ReadTemp(void)
+{
+	uchar j;
+	int b,temp=0;	
+	DS18B20_ReSet();					// 产生复位脉
+	DS18B20_WriteByte(0xcc);			// 忽略ROM指令
+	DS18B20_WriteByte(0x44);			// 启动温度转换指令
+	DS18B20_ReSet();					// 产生复位脉
+	DS18B20_WriteByte(0xcc);			// 忽略ROM指令
+	DS18B20_WriteByte(0xbe);			// 读取温度指令
+	for(j=0;j<16;j++)					// 读取温度数量
+	{						
+		DQ=0;
+		_nop_();
+		_nop_();
+		DQ=1;	
+		Delay15us();
+		b=DQ;
+		Delay15us();
+		Delay15us();
+		Delay15us();
+		b=b<<j;
+		temp=temp|b;
+	}
+	temp=temp*0.0625;				// 合成温度值	
+	return (temp);						// 返回检测到的温度值
+}
+ 
+/*********************************************************/
+// 1602液晶写命令函数，cmd就是要写入的命令
+/*********************************************************/
+void LcdWriteCmd(uchar cmd)
+{ 
+	LcdRs_P = 0;
+	LcdRw_P = 0;
+	LcdEn_P = 0;
+	P0=cmd;
+	DelayMs(2);
+	LcdEn_P = 1;    
+	DelayMs(2);
+	LcdEn_P = 0;	
+}
+ 
+/*********************************************************/
+// 1602液晶写数据函数，dat就是要写入的数据
+/*********************************************************/
+void LcdWriteData(uchar dat)
+{
+	LcdRs_P = 1; 
+	LcdRw_P = 0;
+	LcdEn_P = 0;
+	P0=dat;
+	DelayMs(2);
+	LcdEn_P = 1;    
+	DelayMs(2);
+	LcdEn_P = 0;
+}
+ 
+/*********************************************************/
+// 1602液晶初始化函数
+/*********************************************************/
+void LcdInit()
+{
+	LcdWriteCmd(0x38);        // 16*2显示，5*7点阵，8位数据口
+	LcdWriteCmd(0x0C);        // 开显示，不显示光标
+	LcdWriteCmd(0x06);        // 地址加1，当写入数据后光标右移
+	LcdWriteCmd(0x01);        // 清屏
+}
+ 
+/*********************************************************/
+// 液晶光标定位函数
+/*********************************************************/
+void LcdGotoXY(uchar line,uchar column)
+{
+	// 第一行
+	if(line==0)        
+		LcdWriteCmd(0x80+column); 
+	 // 第二行
+	if(line==1)        
+		LcdWriteCmd(0x80+0x40+column); 
+}
+ 
+/*********************************************************/
+// 液晶输出字符串函数
+/*********************************************************/
+void LcdPrintStr(uchar *str)
+{
+	while(*str!='\0')
+		LcdWriteData(*str++);
+}
+ 
+/*********************************************************/
+// 液晶输出数字
+/*********************************************************/
+void LcdPrintNum1(uchar num)
+{
+	LcdWriteData(num/100+48);			// 百位
+	LcdWriteData(num%100/10+48);		// 十位
+	LcdWriteData(num%10+48); 			// 个位
+}
+ 
+/*********************************************************/
+// 温度值的显示
+/*********************************************************/
+void LcdPrintNum2(int num)
+{
+	if(num<0)									// 显示负号
+	{
+		LcdWriteData('-');
+		num=0-num;	
+	}
+	else            							// 显示百位
+	{
+		LcdWriteData(num/100+48);
+	}
+	LcdWriteData(num%100/10+48);				// 显示十位
+	LcdWriteData(num%10+48);					// 显示个位
+}
+ 
+/*********************************************************/
+// 液晶显示初始化
+/*********************************************************/
+void LcdShowInit()
+{
+	LcdGotoXY(0,0);					// 液晶光标定位到第0行
+	LcdPrintStr("Gas:            ");		// 液晶第0行显示" Gas:           "
+	LcdGotoXY(1,0);					// 液晶光标定位到第1行
+	LcdPrintStr("Tmp:            ");	// 液晶第1行显示"Temp:           "
+}
+ 
+ 
+/*********************************************************/
+// ADC0832的时钟脉冲
+/*********************************************************/
+void WavePlus()
+{
+	_nop_();
+	ADC_CLK = 1;
+	_nop_();
+	ADC_CLK = 0;
+}
+ 
+/*********************************************************/
+// 获取指定通道的A/D转换结果
+/*********************************************************/
+uchar Get_ADC0832()
+{ 
+	uchar i;
+	uchar dat1=0;
+	uchar dat2=0;
+	ADC_CLK = 0;				// 电平初始化
+	ADC_DAT = 1;
+	_nop_();
+	ADC_CS = 0;
+	WavePlus();				// 起始信号 
+	ADC_DAT = 1;
+	WavePlus();				// 通道选择的第一位
+	ADC_DAT = 0;      
+	WavePlus();				// 通道选择的第二位
+	ADC_DAT = 1;
+	for(i=0;i<8;i++)			// 第一次读取
+	{
+		dat1<<=1;
+		WavePlus();
+		if(ADC_DAT)
+			dat1=dat1|0x01;
+		else
+			dat1=dat1|0x00;
+	}
+	for(i=0;i<8;i++)			// 第二次读取
+	{
+		dat2>>= 1;
+		if(ADC_DAT)
+			dat2=dat2|0x80;
+		else
+			dat2=dat2|0x00;
+		WavePlus();
+	}
+	_nop_();					// 结束此次传输
+	ADC_DAT = 1;
+	ADC_CLK = 1;
+	ADC_CS  = 1;   
+	if(dat1==dat2)				// 返回采集结果
+		return dat1;
+	else
+		return 0;
+} 
+ 
+/*********************************************************/
+// 按键扫描
+/*********************************************************/
+void KeyScanf()
+{
+	if(Key1_P==0)
+	{
+		LcdGotoXY(0,13);
+		LcdWriteCmd(0x0f);		// 显示光标，并闪烁
+		
+		/*****烟雾报警值的设置**********************/
+		DelayMs(10);				// 延时去除按键按下的抖动
+		while(!Key1_P);			// 等待按键释放
+		DelayMs(10);		   		// 延时去除按键松开的抖动
+		
+		while(Key1_P!=0)			// 如果按键1按下，那么跳到下一级设置
+		{
+			if(Key2_P==0)					// 如果减按键被按下	
+			{
+				if(gMqAlarm>1)			// 只有gMqAlarm大于1才能减1		
+					gMqAlarm--;				
+				LcdGotoXY(0,11);			// 液晶光标定位到第0行第11列
+				LcdPrintNum1(gMqAlarm);	// 刷新改变后的报警值
+				LcdGotoXY(0,13);
+				DelayMs(250);				// 延时一下
+			}
+			if(Key3_P==0)					// 如果加按键被按下	
+			{
+				if(gMqAlarm<100)			// 只有gMqAlarm小于100才能加1
+					gMqAlarm++;				
+				LcdGotoXY(0,11);			// 液晶光标定位到第0行第11列
+				LcdPrintNum1(gMqAlarm);	// 刷新改变后的报警值
+				LcdGotoXY(0,13);
+				DelayMs(250);				// 延时一下
+			}
+		}
+		
+		/*****温度报警值设置******************/
+		LcdGotoXY(1,13);			// 光标定位
+		DelayMs(10);				// 延时去除按键按下的抖动
+		while(!Key1_P);			// 等待按键释放
+		DelayMs(10);		   		// 延时去除按键松开的抖动
+		while(Key1_P!=0)			// 如果按键1按下，则退出设置模式
+		{
+			if(Key2_P==0)					// 如果减按键被按下	
+			{
+				if(gTempAlarm>-54)		// 只有gTempAlarm大于-54才能减1	
+					gTempAlarm--;				
+				LcdGotoXY(1,11);			// 液晶光标定位到第1行第11列
+				LcdPrintNum2(gTempAlarm);	// 刷新改变后的报警值
+				LcdGotoXY(1,13);
+				DelayMs(250);				// 延时一下
+			}
+			if(Key3_P==0)					// 如果加按键被按下	
+			{
+				if(gTempAlarm<125)		// 只有gTempAlarm小于125才能加1
+					gTempAlarm++;				
+				LcdGotoXY(1,11);			// 液晶光标定位到第0行第11列
+				LcdPrintNum2(gTempAlarm);	// 刷新改变后的报警值
+				LcdGotoXY(1,13);
+				DelayMs(250);				// 延时一下
+			}				
+		}
+		
+		/*****退出报警值的设置***************/
+		DelayMs(10);					// 延时去除按键按下的抖动
+		while(!Key1_P);				// 等待按键释放
+		DelayMs(10);		   			// 延时去除按键松开的抖动
+		
+		Sector_Erase(0x2000);			// 擦除单片机内部EEPROM的数据
+		EEPROM_Write(0x2000,gMqAlarm);		// 将新设置的烟雾报警值写入EEPROM
+		EEPROM_Write(0x2001,gTempAlarm+55);	// 将新设置的温度报警值+55写入
+		LcdWriteCmd(0x0c);					// 关闭光标
+	}
+}
+ 
+/*********************************************************/
+// 报警判断
+/*********************************************************/
+void AlarmJudge(uchar dat1, int dat2)
+{
+	/*烟雾报警判断*/
+	if(dat1>gMqAlarm)
+	{
+		Led2_P=0;		// 点亮
+	}
+	else
+	{
+		Led2_P=1;		// 熄灭
+	}
+	
+	/*温度报警判断*/
+	if(dat2>gTempAlarm)
+	{	
+		Led1_P=0;
+	}
+	else
+	{
+		Led1_P=1;
+	}
+ 
+	/*蜂鸣器报警判断*/
+	if((Led1_P==0)||(Led2_P==0))
+		Buzzer_P=0;
+	else
+		Buzzer_P=1;
+}
+ 
+/********************************************************
+主函数
+********************************************************/
+void main(void)
+{
+	int   temp;							// 保存温度值
+	uchar num;							// 保存烟雾值
+	uchar i;								// 循环变量
+	
+	LcdInit();				    			// 液晶功能初始化
+	LcdShowInit();							// 液晶显示内容初始化
+	
+	gMqAlarm=EEPROM_Read(0x2000);		// 从EEPROM中读取报警值
+	if((gMqAlarm==0)||(gMqAlarm>100))		// 如果读出来数据异常，则重新赋值30
+		gMqAlarm=30;
+	LcdGotoXY(0,11);						// 光标定位
+	LcdPrintNum1(gMqAlarm);				// 显示烟雾浓度的报警值
+	
+	gTempAlarm=EEPROM_Read(0x2001)-55;	// 将温度报警值读取出来
+	if((gTempAlarm<=-55)||(gTempAlarm>125))	// 如果读出来数据异常，则重新赋值400		gTempAlarm=40;
+	LcdGotoXY(1,11);						// 光标定位
+	LcdPrintNum2(gTempAlarm);				// 显示温度的报警值
+	
+	while(DS18B20_ReadTemp()==85)			// 等待温度传感器初始化完成
+	{
+		DelayMs(10);
+	}
+	
+	while(1)
+	{
+		num=Get_ADC0832();				// 获取烟雾的浓度值
+		num=num/2.2;					// 调整浓度值，使其在0-100之间变化
+		if(num>100)
+			num=100;
+		LcdGotoXY(0,5);					// 液晶光标定位到第0行第5列
+		LcdPrintNum1(num);				// 显示烟雾浓度的值
+		
+		temp=DS18B20_ReadTemp();			// 读取温度值
+		LcdGotoXY(1,5);					// 液晶光标定位到第1行第5列
+		LcdPrintNum2(temp);				// 显示温度值
+		
+		AlarmJudge(num,temp);				// 报警判断
+		
+		for(i=0;i<15;i++)					// 执行15次循环
+		{
+			KeyScanf();					// 按键扫描
+			DelayMs(10);					// 延时
+		}
+	}
+}
